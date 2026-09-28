@@ -12,7 +12,7 @@
 html,body,#map{margin:0;width:100%;height:100%}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#111}
 .panel{
-  position:fixed;z-index:5;left:16px;top:16px;width:min(430px,calc(100vw - 32px));box-sizing:border-box;
+  position:fixed;z-index:5;left:16px;top:16px;width:min(430px,calc(100vw - 32px));box-sizing:border-box;max-height:calc(100vh - 32px);overflow-y:auto;
   background:rgba(15,15,15,.91);color:#fff;padding:14px 15px;border-radius:14px;
   backdrop-filter:blur(12px);box-shadow:0 8px 26px rgba(0,0,0,.28)
 }
@@ -83,12 +83,16 @@ kbd{background:#333;border:1px solid #555;border-radius:4px;padding:1px 4px;font
 
     <div class="camgrid">
       <div class="camitem">
-        <div class="lab"><span>Yön</span><b id="bearingText">0°</b></div>
+        <div class="lab"><label for="bearing">Yön</label><b id="bearingText">0°</b></div>
         <input id="bearing" type="range" min="0" max="359" step="1" value="0">
       </div>
       <div class="camitem">
-        <div class="lab"><span>Eğim</span><b id="pitchText">68°</b></div>
+        <div class="lab"><label for="pitch">Eğim</label><b id="pitchText">68°</b></div>
         <input id="pitch" type="range" min="0" max="85" step="1" value="68">
+      </div>
+      <div class="camitem">
+        <div class="lab"><label for="zoom">Yakınlık</label><b id="zoomText">5.0</b></div>
+        <input id="zoom" type="range" min="0" max="22" step="0.1" value="5">
       </div>
     </div>
 
@@ -100,7 +104,7 @@ kbd{background:#333;border:1px solid #555;border-radius:4px;padding:1px 4px;font
     <div class="hint">
       Fareyle döndürme: <kbd>sağ tık</kbd> + sürükle veya <kbd>Ctrl</kbd> + sürükle.
       Trackpad’de iki parmakla kaydırma/zoom; yönü döndürmek için MapLibre’ın sağ üst pusulasını da sürükleyebilirsin.
-      “Yönü ben yöneteyim” modunda rota konumu takip edilir ama bearing/pitch sana bırakılır.
+      “Yönü ben yöneteyim” modunda yön, eğim ve yakınlık sana bırakılır. Sürükleyerek gezinirken takip bekler; bıraktığında devam eder. Serbest modda kamera hiç takip etmez. Genel görünüm sabittir.
     </div>
   </div>
 
@@ -119,25 +123,31 @@ kbd{background:#333;border:1px solid #555;border-radius:4px;padding:1px 4px;font
 </div>
 
 <script>
-let C=[], E=[], peakIndex=0, bounds=null, marker=null;
-let routeReady=false, playing=false, raf=null, lastTs=null, progressU=0, speed=1, mode='north';
-let totalDistanceKm=0;
+'use strict';
+// DOM references never share names with numeric playback state.
+const ui=Object.fromEntries([...document.querySelectorAll('[id]')].map(el=>[el.id,el]));
+const BASE_DURATION=52000;
+const playback={progress:0,rate:1,playing:false,lastTs:null,raf:null};
+let C=[], E=[], peakIndex=0, bounds=null, marker=null, routeReady=false;
+let mode='north', styleReady=false, pendingRoute=null, loadVersion=0;
+let overviewCamera=null, cameraWrite=false, panYield=false, recenter=null;
+const gestureHandlers=['dragPan','dragRotate','scrollZoom','boxZoom','doubleClickZoom','keyboard','touchZoomRotate','touchPitch'];
 
-const BASE_DURATION = 52000;
-
-const map = new maplibregl.Map({
-  container:'map',
-  style:'https://tiles.openfreemap.org/styles/liberty',
-  center:[25,46],
-  zoom:5,
-  pitch:68,
-  bearing:0,
-  maxPitch:85,
-  attributionControl:true,
-  dragRotate:true,
-  pitchWithRotate:true
+const map=new maplibregl.Map({
+  container:'map',style:'https://tiles.openfreemap.org/styles/liberty',
+  center:[25,46],zoom:5,pitch:68,bearing:0,maxPitch:85,
+  attributionControl:true,dragRotate:true,pitchWithRotate:true,
+  // Let MapLibre apply gestures itself. This public hook anchors rotation/zoom
+  // to the moving route without calling jumpTo (which stops input handlers).
+  transformCameraUpdate:()=>{
+    if(cameraWrite) return {};
+    if(mode==='overview' && overviewCamera) return overviewCamera;
+    if(!routeReady || !playback.playing || !isFollow() || panYield || map.dragPan.isActive()) return {};
+    const options=followOptions();
+    options.center=maplibregl.LngLat.convert(options.center);
+    return options;
+  }
 });
-
 map.addControl(new maplibregl.NavigationControl({visualizePitch:true}),'top-right');
 
 function haversineKm(a,b){
@@ -152,8 +162,8 @@ function parseGPX(text){
   const xml = new DOMParser().parseFromString(text,'application/xml');
   if(xml.querySelector('parsererror')) throw new Error('GPX/XML okunamadı.');
 
-  let pts=[...xml.getElementsByTagName('trkpt')];
-  if(!pts.length) pts=[...xml.getElementsByTagName('rtept')];
+  let pts=[...xml.getElementsByTagNameNS('*','trkpt')];
+  if(!pts.length) pts=[...xml.getElementsByTagNameNS('*','rtept')];
   if(!pts.length) throw new Error('Dosyada trkpt veya rtept bulunamadı.');
 
   const coords=[], elev=[];
@@ -161,18 +171,13 @@ function parseGPX(text){
     const lat=parseFloat(p.getAttribute('lat'));
     const lon=parseFloat(p.getAttribute('lon'));
     if(!Number.isFinite(lat)||!Number.isFinite(lon)) continue;
-    const en=p.getElementsByTagName('ele')[0];
-    const ev=en?parseFloat(en.textContent):0;
+    const en=p.getElementsByTagNameNS('*','ele')[0];
+    const ev=en?parseFloat(en.textContent):NaN;
     coords.push([lon,lat]);
-    elev.push(Number.isFinite(ev)?ev:0);
+    elev.push(Number.isFinite(ev)?ev:null);
   }
   if(coords.length<2) throw new Error('Geçerli rota noktası yetersiz.');
   return {coords,elev};
-}
-
-function feat(u){
-  const n=Math.max(2,Math.floor(u*(C.length-1))+1);
-  return {type:'Feature',properties:{},geometry:{type:'LineString',coordinates:C.slice(0,n)}};
 }
 
 function brg(a,b){
@@ -184,143 +189,168 @@ function brg(a,b){
   ))+360)%360;
 }
 
+
+function sampleRoute(u=playback.progress){
+  const x=Math.max(0,Math.min(1,u))*(C.length-1);
+  const i=Math.min(C.length-2,Math.floor(x)), t=x-i;
+  const a=C[i],b=C[i+1];
+  return {i,t,center:[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t]};
+}
+function feat(u){
+  const {i,center}=sampleRoute(u);
+  return {type:'Feature',properties:{},geometry:{type:'LineString',coordinates:[...C.slice(0,i+1),center]}};
+}
+function headingAt(i){
+  let j=Math.min(C.length-1,i+16);
+  while(j<C.length-1 && haversineKm(C[i],C[j])<1e-8) j++;
+  if(haversineKm(C[i],C[j])>=1e-8) return brg(C[i],C[j]);
+  let k=i;
+  while(k>0 && haversineKm(C[k],C[j])<1e-8) k--;
+  return haversineKm(C[k],C[j])>=1e-8?brg(C[k],C[j]):map.getBearing();
+}
+function isFollow(){return ['north','route','manualFollow'].includes(mode);}
+function followOptions(){
+  const {i,t,center}=sampleRoute();
+  const options={center};
+  // After a pan (including inertia), catch up once without starting an easeTo.
+  if(recenter){
+    const t=Math.min(1,Math.max(0,(performance.now()-recenter.at)/250));
+    const k=1-(1-t)**3;
+    options.center=center.map((value,i)=>recenter.center[i]+(value-recenter.center[i])*k);
+    if(t===1) recenter=null;
+  }
+  if(mode==='north') options.bearing=0;
+  if(mode==='route'){
+    const a=headingAt(i),b=headingAt(i+1);
+    options.bearing=a+(((b-a+540)%360)-180)*t;
+  }
+  return options; // Manual follow never supplies pitch, bearing or zoom.
+}
+function cameraBusy(){
+  return map.isMoving() || gestureHandlers.some(name=>map[name]?.isActive?.());
+}
+function writeCamera(options){
+  cameraWrite=true;
+  try{map.jumpTo(options);}finally{cameraWrite=false;}
+}
+function applyCamera(){
+  if(!routeReady || !isFollow() || panYield || cameraBusy()) return;
+  writeCamera(followOptions());
+}
+function syncCameraUI(){
+  const b=((map.getBearing()%360)+360)%360,p=map.getPitch(),z=map.getZoom();
+  ui.bearing.value=Math.round(b)%360;ui.bearingText.textContent=(Math.round(b)%360)+'°';
+  ui.pitch.value=p;ui.pitchText.textContent=Math.round(p)+'°';
+  ui.zoom.value=z;ui.zoomText.textContent=z.toFixed(1);
+}
+function setMode(next,position=true){
+  // Cancel a one-shot navigation animation before changing camera ownership.
+  map.stop();
+  mode=next;ui.camera.value=mode;overviewCamera=null;panYield=false;recenter=null;
+  const fixed=mode==='overview';
+  for(const name of gestureHandlers) map[name]?.[fixed?'disable':'enable']();
+  for(const name of ['bearing','pitch','zoom']) ui[name].disabled=fixed;
+  if(fixed && bounds){
+    cameraWrite=true;
+    try{map.fitBounds(bounds,{padding:70,pitch:58,bearing:0,duration:0});}
+    finally{cameraWrite=false;}
+    overviewCamera={center:map.getCenter(),bearing:map.getBearing(),pitch:map.getPitch(),zoom:map.getZoom()};
+  }else if(position) applyCamera();
+  syncCameraUI();
+}
 function setLoad(txt,cls){
-  const e=document.getElementById('lstat');
-  e.className='status '+cls;
-  e.innerHTML='<span class="dot"></span>'+txt;
+  ui.lstat.className='status '+cls;
+  ui.lstat.replaceChildren(Object.assign(document.createElement('span'),{className:'dot'}),document.createTextNode(txt));
 }
-
+function renderProgress(){
+  if(!routeReady) return;
+  const {i,t,center}=sampleRoute();
+  map.getSource('prog')?.setData(feat(playback.progress));
+  marker?.setLngLat(center);
+  ui.scrub.value=Math.round(playback.progress*1000);
+  ui.pText.textContent=Math.round(playback.progress*100)+'%';
+  const elevation=E[i]!==null && E[i+1]!==null ? E[i]+(E[i+1]-E[i])*t : null;
+  ui.rstat.textContent=`Rakım ${elevation===null?'—':Math.round(elevation)+' m'} • nokta ${Math.min(C.length,Math.floor(playback.progress*(C.length-1))+1)}/${C.length}`;
+}
 function stop(){
-  playing=false;
-  if(raf) cancelAnimationFrame(raf);
-  raf=null; lastTs=null;
-  document.getElementById('play').textContent='▶ Oynat';
+  playback.playing=false;
+  if(playback.raf!==null) cancelAnimationFrame(playback.raf);
+  playback.raf=null;playback.lastTs=null;
+  ui.play.textContent='▶ Oynat';
 }
-
-function currentIndex(){
-  return Math.min(C.length-1,Math.floor(progressU*(C.length-1)));
+function advance(now){
+  if(!playback.playing) return;
+  const dt=Math.max(0,now-playback.lastTs);
+  playback.lastTs=Math.max(playback.lastTs,now);
+  playback.progress=Math.min(1,playback.progress+dt/BASE_DURATION*playback.rate);
+  if(playback.progress>=1) stop();
 }
-
-function applyCamera(i){
-  if(!routeReady) return;
-
-  if(mode==='north'){
-    map.jumpTo({center:C[i],zoom:10.6,pitch:+pitch.value,bearing:0});
-  }else if(mode==='route' && i<C.length-1){
-    const j=Math.min(C.length-1,i+16);
-    map.jumpTo({center:C[i],zoom:10.9,pitch:+pitch.value,bearing:brg(C[i],C[j])});
-  }else if(mode==='manualFollow'){
-    map.jumpTo({center:C[i],zoom:map.getZoom(),pitch:+pitch.value,bearing:+bearing.value});
-  }
+function anim(now){
+  playback.raf=null;
+  if(!playback.playing) return;
+  advance(now);
+  renderProgress();applyCamera();
+  if(playback.playing) playback.raf=requestAnimationFrame(anim);
 }
-
-function setU(u,cam=true){
-  if(!routeReady) return;
-  progressU=Math.max(0,Math.min(1,u));
-
-  const i=currentIndex();
-  const s=map.getSource('prog');
-  if(s) s.setData(feat(progressU));
-  if(marker) marker.setLngLat(C[i]);
-
-  scrub.value=Math.round(progressU*1000);
-  pText.textContent=Math.round(progressU*100)+'%';
-  rstat.textContent=`Rakım ${Math.round(E[i])} m • nokta ${i+1}/${C.length}`;
-
-  if(cam) applyCamera(i);
+function start(){
+  if(!routeReady || playback.playing || playback.rate<=0 || document.hidden) return;
+  if(playback.progress>=1){playback.progress=0;renderProgress();}
+  playback.playing=true;playback.lastTs=performance.now();
+  ui.play.textContent='⏸ Duraklat';
+  playback.raf=requestAnimationFrame(anim);
 }
-
-function anim(ts){
-  if(!playing) return;
-  if(speed<=0){ stop(); return; }
-
-  if(lastTs===null) lastTs=ts;
-  const dt=Math.min(100,ts-lastTs);
-  lastTs=ts;
-
-  progressU += (dt/BASE_DURATION)*speed;
-  setU(progressU,true);
-
-  if(progressU<1) raf=requestAnimationFrame(anim);
-  else { progressU=1; setU(1,true); stop(); }
-}
-
 function clearRouteLayers(){
-  stop();
-  if(map.getLayer('route-fg')) map.removeLayer('route-fg');
-  if(map.getLayer('route-bg')) map.removeLayer('route-bg');
-  if(map.getSource('prog')) map.removeSource('prog');
-  if(map.getSource('route')) map.removeSource('route');
-  if(marker){marker.remove();marker=null;}
+  stop();routeReady=false;
+  for(const id of ['route-fg','route-bg']) if(map.getLayer(id)) map.removeLayer(id);
+  for(const id of ['prog','route']) if(map.getSource(id)) map.removeSource(id);
+  marker?.remove();marker=null;
 }
-
-function installRoute(){
+function replaceRoute(parsed){
   clearRouteLayers();
-
-  map.addSource('route',{
-    type:'geojson',
-    data:{type:'Feature',properties:{},geometry:{type:'LineString',coordinates:C}}
-  });
-  map.addLayer({
-    id:'route-bg',type:'line',source:'route',
-    layout:{'line-cap':'round','line-join':'round'},
-    paint:{'line-color':'#111','line-width':8,'line-opacity':.30}
-  });
-
+  C=parsed.coords;E=parsed.elev;
+  peakIndex=E.reduce((best,v,i)=>v!==null && (E[best]===null || v>E[best])?i:best,0);
+  bounds=new maplibregl.LngLatBounds();C.forEach(c=>bounds.extend(c));
+  playback.progress=0;
+  map.addSource('route',{type:'geojson',data:{type:'Feature',properties:{},geometry:{type:'LineString',coordinates:C}}});
+  map.addLayer({id:'route-bg',type:'line',source:'route',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#111','line-width':8,'line-opacity':.30}});
   map.addSource('prog',{type:'geojson',data:feat(0)});
-  map.addLayer({
-    id:'route-fg',type:'line',source:'prog',
-    layout:{'line-cap':'round','line-join':'round'},
-    paint:{'line-color':'#ff3b30','line-width':6}
-  });
-
-  const el=document.createElement('div'); el.className='marker';
-  marker=new maplibregl.Marker({element:el}).setLngLat(C[0]).addTo(map);
-
-  bounds=new maplibregl.LngLatBounds();
-  C.forEach(c=>bounds.extend(c));
-  map.fitBounds(bounds,{padding:70,pitch:58,bearing:0,duration:700});
-
-  progressU=0;
+  map.addLayer({id:'route-fg',type:'line',source:'prog',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#ff3b30','line-width':6}});
+  marker=new maplibregl.Marker({element:Object.assign(document.createElement('div'),{className:'marker'})}).setLngLat(C[0]).addTo(map);
   routeReady=true;
-  setU(0,false);
-
-  play.disabled=false; overview.disabled=false; peak.disabled=false; scrub.disabled=false;
+  updateMeta();renderProgress();
+  // Loading a route is an explicit framing action; preserve manual orientation.
+  cameraWrite=true;
+  try{map.fitBounds(bounds,{padding:70,pitch:map.getPitch(),bearing:mode==='north'?0:map.getBearing(),duration:0});}
+  finally{cameraWrite=false;}
+  setMode(mode,false);
+  for(const name of ['play','overview','scrub']) ui[name].disabled=false;
+  ui.peak.disabled=E.every(v=>v===null);
+  updateTileState();
 }
-
 function updateMeta(){
-  totalDistanceKm=0;
-  for(let i=1;i<C.length;i++) totalDistanceKm+=haversineKm(C[i-1],C[i]);
-  pointCount.textContent=C.length.toLocaleString('tr-TR');
-  distance.textContent=totalDistanceKm.toFixed(1)+' km';
-  minEle.textContent=Math.round(Math.min(...E))+' m';
-  maxEle.textContent=Math.round(Math.max(...E))+' m';
-  meta.style.display='grid';
-}
-
-function updateSpeedLabel(){
-  if(speed<=0){
-    speedText.textContent='0% • duraklat';
-  }else{
-    const secs=BASE_DURATION/(1000*speed);
-    speedText.textContent=`${Math.round(speed*100)}% • ${secs<90?secs.toFixed(0)+' sn':(secs/60).toFixed(1)+' dk'}`;
+  let km=0,min=Infinity,max=-Infinity;
+  for(let i=0;i<C.length;i++){
+    if(i) km+=haversineKm(C[i-1],C[i]);
+    if(E[i]!==null){min=Math.min(min,E[i]);max=Math.max(max,E[i]);}
   }
+  ui.pointCount.textContent=C.length.toLocaleString('tr-TR');
+  ui.distance.textContent=km.toFixed(1)+' km';
+  ui.minEle.textContent=Number.isFinite(min)?Math.round(min)+' m':'—';
+  ui.maxEle.textContent=Number.isFinite(max)?Math.round(max)+' m':'—';
+  ui.meta.style.display='grid';
 }
-
+function updateSpeedLabel(){
+  const rate=playback.rate;
+  const secs=rate>0?BASE_DURATION/(1000*rate):0;
+  ui.speedText.textContent=rate<=0?'0% • duraklat':`${Math.round(rate*100)}% • ${secs<90?secs.toFixed(0)+' sn':(secs/60).toFixed(1)+' dk'}`;
+}
 function updateTileState(){
-  if(!map.loaded()){setLoad('Harita stili ve tile’lar yükleniyor…','loading');return;}
-  if(map.areTilesLoaded && map.areTilesLoaded()) setLoad('Görünen harita hazır ✓','ready');
+  if(!styleReady){setLoad('Harita stili hazırlanıyor…','loading');return;}
+  if(map.areTilesLoaded()) setLoad('Görünen harita hazır ✓','ready');
   else setLoad('Görünen alan yükleniyor… rota oynatılabilir','loading');
 }
-
-function syncCameraUI(){
-  const b=Math.round((map.getBearing()+360)%360);
-  const p=Math.round(map.getPitch());
-  bearing.value=b; bearingText.textContent=b+'°';
-  pitch.value=p; pitchText.textContent=p+'°';
-}
-
 map.on('style.load',()=>{
+  styleReady=true;
   if(!map.getSource('dem')){
     map.addSource('dem',{
       type:'raster-dem',
@@ -342,115 +372,97 @@ map.on('style.load',()=>{
       }
     },firstSymbol?firstSymbol.id:undefined);
   }
+  if(pendingRoute){
+    const parsed=pendingRoute; pendingRoute=null;
+    replaceRoute(parsed);
+  }
 });
+
 
 map.on('load',()=>{updateTileState();syncCameraUI();});
 map.on('dataloading',updateTileState);
 map.on('sourcedata',updateTileState);
 map.on('idle',updateTileState);
-map.on('rotate',syncCameraUI);
-map.on('pitch',syncCameraUI);
+map.on('move',syncCameraUI);
+// A user's rotation is an explicit request for manual orientation, including
+// compass gestures; changes generated by following have no originalEvent.
+map.on('rotate',event=>{
+  if(event.originalEvent && (mode==='north' || mode==='route')){
+    mode='manualFollow';ui.camera.value=mode;
+  }
+  syncCameraUI();
+});
+// Panning temporarily yields follow through its inertial movement.
+map.on('dragstart',event=>{if(event.originalEvent){panYield=true;recenter=null;}});
+map.on('moveend',()=>{
+  if(!panYield) return;
+  panYield=false;
+  if(routeReady && isFollow() && playback.playing){
+    const c=map.getCenter();
+    recenter={center:[c.lng,c.lat],at:performance.now()};
+  }
+});
 
-gpxFile.addEventListener('change',async e=>{
-  const file=e.target.files&&e.target.files[0];
+ui.gpxFile.addEventListener('change',async e=>{
+  const file=e.target.files?.[0];
   if(!file)return;
-
-  stop();
-  setLoad('GPX okunuyor…','loading');
-
+  const version=++loadVersion;
+  pendingRoute=null;stop();
+  ui.rstat.textContent='GPX okunuyor…';
   try{
     const parsed=parseGPX(await file.text());
-    C=parsed.coords;E=parsed.elev;
-    peakIndex=E.reduce((best,v,i,a)=>v>a[best]?i:best,0);
-    updateMeta();
-    installRoute();
-    setLoad('GPX yüklendi ✓ • görünen harita yüklenmeye devam edebilir','ready');
+    if(version!==loadVersion) return;
+    if(styleReady) replaceRoute(parsed);
+    else {pendingRoute=parsed;ui.rstat.textContent='GPX hazır; harita stili bekleniyor…';}
   }catch(err){
-    routeReady=false;
-    play.disabled=true;overview.disabled=true;peak.disabled=true;scrub.disabled=true;
-    setLoad(err.message||'GPX yüklenemedi.','error');
-  }
+    if(version===loadVersion) ui.rstat.textContent=err.message||'GPX yüklenemedi.';
+    // A failed replacement keeps the previous valid route usable, paused.
+  }finally{if(version===loadVersion) e.target.value='';}
 });
-
-play.addEventListener('click',()=>{
+ui.play.addEventListener('click',()=>{
+  if(playback.playing){stop();return;}
+  if(playback.rate<=0){ui.rstat.textContent='Hız 0%. Oynatmak için hızı artır.';return;}
+  start();
+});
+ui.speed.addEventListener('input',e=>{
+  // Account for time at the old rate before adopting the new rate.
+  advance(performance.now());
+  playback.rate=Number(e.target.value)/100;
+  if(playback.rate<=0) stop();
+  updateSpeedLabel();renderProgress();
+});
+ui.scrub.addEventListener('input',e=>{
+  if(!routeReady) return;
+  playback.progress=Math.max(0,Math.min(1,Number(e.target.value)/1000));
+  if(playback.playing) playback.lastTs=performance.now();
+  renderProgress();applyCamera();
+  if(playback.progress===1) stop();
+});
+ui.camera.addEventListener('change',e=>setMode(e.target.value));
+ui.bearing.addEventListener('input',e=>{
+  const value=Number(e.target.value);
+  if(mode==='north' || mode==='route') setMode('manualFollow',false);
+  writeCamera({bearing:value});
+});
+ui.pitch.addEventListener('input',e=>writeCamera({pitch:Number(e.target.value)}));
+ui.zoom.addEventListener('input',e=>writeCamera({zoom:Number(e.target.value)}));
+ui.northBtn.addEventListener('click',()=>{
+  setMode(mode==='free'?'free':'north',false);writeCamera({bearing:0});applyCamera();
+});
+ui.cameraHere.addEventListener('click',()=>{
+  if(!routeReady) return;
+  if(mode==='overview') setMode('manualFollow',false);
+  writeCamera({center:sampleRoute().center});
+});
+ui.overview.addEventListener('click',()=>{if(routeReady) setMode('overview');});
+ui.peak.addEventListener('click',()=>{
   if(!routeReady)return;
-
-  if(playing){stop();return;}
-  if(speed<=0){setLoad('Hız 0%. Oynatmak için hızı artır.','warn');return;}
-
-  if(progressU>=1) progressU=0;
-  playing=true;lastTs=null;
-  play.textContent='⏸ Duraklat';
-  raf=requestAnimationFrame(anim);
-});
-
-speed.addEventListener('input',e=>{
-  speed=+e.target.value/100;
-  updateSpeedLabel();
-  if(speed<=0 && playing) stop();
-});
-
-camera.addEventListener('change',e=>{
-  mode=e.target.value;
-  const i=currentIndex();
-
-  if(mode==='overview' && bounds){
-    map.fitBounds(bounds,{padding:70,pitch:58,bearing:0,duration:700});
-  }else if(mode==='north'){
-    map.easeTo({center:C[i],bearing:0,pitch:+pitch.value,zoom:10.6,duration:500});
-  }else if(mode==='route' && routeReady){
-    const j=Math.min(C.length-1,i+16);
-    map.easeTo({center:C[i],bearing:brg(C[i],C[j]),pitch:+pitch.value,zoom:10.9,duration:500});
-  }else if(mode==='manualFollow' && routeReady){
-    map.easeTo({center:C[i],bearing:+bearing.value,pitch:+pitch.value,duration:400});
-  }
-});
-
-bearing.addEventListener('input',e=>{
-  bearingText.textContent=e.target.value+'°';
-  map.setBearing(+e.target.value);
-  if(mode==='north' || mode==='route') {
-    mode='manualFollow';
-    camera.value='manualFollow';
-  }
-});
-
-pitch.addEventListener('input',e=>{
-  pitchText.textContent=e.target.value+'°';
-  map.setPitch(+e.target.value);
-});
-
-northBtn.addEventListener('click',()=>{
-  bearing.value=0;bearingText.textContent='0°';
-  map.easeTo({bearing:0,duration:400});
-});
-
-cameraHere.addEventListener('click',()=>{
-  if(!routeReady)return;
-  const i=currentIndex();
-  map.easeTo({center:C[i],zoom:10.7,pitch:+pitch.value,bearing:+bearing.value,duration:600});
-});
-
-scrub.addEventListener('input',e=>{
-  stop();
-  progressU=+e.target.value/1000;
-  setU(progressU,true);
-});
-
-overview.addEventListener('click',()=>{
-  if(!bounds)return;
-  mode='overview';camera.value='overview';
-  map.fitBounds(bounds,{padding:70,pitch:58,bearing:0,duration:1200});
-});
-
-peak.addEventListener('click',()=>{
-  if(!routeReady)return;
-  stop();
-  mode='free';camera.value='free';
+  setMode('free',false);
   map.easeTo({center:C[peakIndex],zoom:11.6,pitch:78,bearing:-35,duration:1200});
 });
-
-updateSpeedLabel();
+// Hidden tabs pause explicitly, rather than jumping ahead after throttled RAFs.
+document.addEventListener('visibilitychange',()=>{if(document.hidden) stop();});
+updateSpeedLabel();syncCameraUI();
 </script>
 </body>
 </html>
