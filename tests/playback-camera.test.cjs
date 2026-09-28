@@ -62,7 +62,7 @@ test('pause/resume preserves visible progress and actual unrounded orientation',
 test('manual follow never stops active rotate/zoom gestures, hook anchors route',()=>{
   const a=app();a.load();a.emit('camera','change','manualFollow');a.emit('play','click');a.map.calls=[];
   a.map.dragRotate.active=true;a.map.moving=true;a.tick(1000);
-  assert.equal(a.map.calls.length,0);const options=a.map.options.transformCameraUpdate();assert.deepEqual(Object.keys(options),['center']);assert.equal(typeof options.center.lng,'number');near(options.center.lng,10+3/52);
+  assert.equal(a.map.calls.length,0);const options=a.map.options.transformCameraUpdate();assert.deepEqual(Object.keys(options),['center']);assert.equal(typeof options.center.lng,'number');near(options.center.lng,a.run('sampleRoute().center[0]'));
 });
 test('pan yields through inertia then recenters with a finite catch-up',()=>{
   const a=app();a.load();a.emit('camera','change','manualFollow');a.emit('play','click');a.map.fire('dragstart',{originalEvent:{}});a.map.dragPan.active=true;a.map.calls=[];a.tick(1000);assert.equal(a.map.calls.length,0);assert.equal(Object.keys(a.map.options.transformCameraUpdate()).length,0);
@@ -111,4 +111,64 @@ test('async file race: newest selection wins; invalid replacement preserves vali
 });
 test('GPX parsed before style readiness installs once style arrives',async()=>{
   const a=app();a.run('parseGPX=()=>({coords:[[20,30],[21,31]],elev:[1,2]})');a.elements.gpxFile.files=[{text:async()=>''}];await a.emit('gpxFile','change');assert.equal(a.run('routeReady'),false);a.map.fire('style.load');assert.equal(a.run('routeReady'),true);assert.equal(a.markers.length,1);
+});
+
+
+test('unequal segment lengths consume playback time in distance proportion',()=>{
+  const a=app();a.run("replaceRoute({coords:[[0,0],[1,0],[1,3]],elev:[0,100,200]})");
+  const first=a.run('segmentDistances[0]'),second=a.run('segmentDistances[1]');
+  assert.ok(Math.abs(second/first-3)<0.002);
+  a.run('playback.playing=true;playback.lastTs=0;advance(BASE_DURATION*.25)');
+  const quarter=a.run('sampleRoute()');assert.equal(quarter.i,0);near(quarter.t,1);
+  a.run('advance(BASE_DURATION*.5)');
+  const half=a.run('sampleRoute()');assert.equal(half.i,1);near(half.t,1/3);near(half.center[1],1);
+  near(a.run(`E[${half.i}]+(E[${half.i+1}]-E[${half.i}])*${half.t}`),400/3);
+});
+test('uneven GPX point density preserves constant geographic speed',()=>{
+  const a=app();
+  a.run(`(()=>{const coords=Array.from({length:101},(_,i)=>[i/100,0]);coords.push([2,0]);replaceRoute({coords,elev:coords.map((_,i)=>i)});})()`);
+  assert.equal(a.run('C.length'),102);
+  for(const u of [.1,.25,.5,.75,.9]){
+    const sample=a.run(`sampleRoute(${u})`);
+    const along=a.run(`cumulativeDistances[${sample.i}]+segmentDistances[${sample.i}]*${sample.t}`);
+    near(along/u,a.run('totalDistance'));
+  }
+  near(a.run('sampleRoute(.5).center[0]'),1);
+  assert.ok(Math.abs(a.run('sampleRoute(.5).center[0]')-.5)>.49,'index-based midpoint would be near longitude .5');
+});
+test('scrubbing to 50% follows half total distance and keeps line/marker aligned',()=>{
+  const a=app();a.load();a.run("replaceRoute({coords:[[0,0],[1,0],[1,3]],elev:[0,100,200]})");
+  a.emit('scrub','input',500);
+  const sample=a.run('sampleRoute()'),lineEnd=a.map.getSource('prog').data.geometry.coordinates.at(-1);
+  near(a.run(`cumulativeDistances[${sample.i}]+segmentDistances[${sample.i}]*${sample.t}`),a.run('totalDistance')/2);
+  assert.deepEqual(lineEnd,a.markers.at(-1).center);assert.deepEqual(lineEnd,sample.center);assert.equal(a.run('playback.progress'),.5);
+});
+test('distance sampling handles duplicate points, endpoints and very short routes',()=>{
+  const a=app();
+  a.run("replaceRoute({coords:[[0,0],[0,0],[.001,0],[.001,0],[.002,0]],elev:[1,2,3,4,5]})");
+  assert.equal(a.run('sampleRoute(0).center[0]'),0);assert.equal(a.run('sampleRoute(0).center[1]'),0);
+  assert.equal(a.run('sampleRoute(1).center[0]'),.002);assert.equal(a.run('sampleRoute(1).center[1]'),0);
+  for(const u of [0,.25,.5,.75,1]){
+    const sample=a.run(`sampleRoute(${u})`);
+    assert.ok(Number.isFinite(sample.t)&&sample.t>=0&&sample.t<=1);
+    assert.ok(Number.isFinite(sample.center[0])&&Number.isFinite(sample.center[1]));
+  }
+  a.run("replaceRoute({coords:[[20,10],[20.00000001,10]],elev:[100,200]})");
+  assert.ok(a.run('totalDistance>0&&totalDistance<.001'));
+  assert.equal(a.run('sampleRoute(0).center[0]'),20);assert.equal(a.run('sampleRoute(0).center[1]'),10);
+  assert.equal(a.run('sampleRoute(1).center[0]'),20.00000001);assert.equal(a.run('sampleRoute(1).center[1]'),10);
+  a.run("replaceRoute({coords:[[5,5],[5,5],[5,5]],elev:[10,20,30]})");
+  assert.equal(a.run('totalDistance'),0);
+  assert.equal(a.run('sampleRoute(0).center[0]'),5);assert.equal(a.run('sampleRoute(0).center[1]'),5);
+  assert.equal(a.run('sampleRoute(1).center[0]'),5);assert.equal(a.run('sampleRoute(1).center[1]'),5);
+});
+test('Heading Up uses distance-based look-ahead and is independent of point density',()=>{
+  const a=app();
+  a.run("replaceRoute({coords:[[0,0],[1,0],[1,1]],elev:[0,0,0]})");
+  const sparse=a.run('headingAt(.4)');
+  a.run("replaceRoute({coords:[[0,0],...Array.from({length:99},(_,i)=>[(i+1)/100,0]),[1,1]],elev:Array(101).fill(0)})");
+  const dense=a.run('headingAt(.4)');
+  assert.ok(Math.abs((((sparse-dense)+540)%360)-180)<0.1,`${sparse} vs ${dense}`);
+  a.emit('camera','change','route');a.run('playback.progress=.4');
+  near(a.run('followOptions().bearing'),dense);
 });

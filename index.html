@@ -128,7 +128,8 @@ kbd{background:#333;border:1px solid #555;border-radius:4px;padding:1px 4px;font
 const ui=Object.fromEntries([...document.querySelectorAll('[id]')].map(el=>[el.id,el]));
 const BASE_DURATION=52000;
 const playback={progress:0,rate:1,playing:false,lastTs:null,raf:null};
-let C=[], E=[], peakIndex=0, bounds=null, marker=null, routeReady=false;
+let C=[], E=[], segmentDistances=[], cumulativeDistances=[], totalDistance=0;
+let peakIndex=0, bounds=null, marker=null, routeReady=false;
 let mode='north', styleReady=false, pendingRoute=null, loadVersion=0;
 let overviewCamera=null, cameraWrite=false, panYield=false, recenter=null;
 const gestureHandlers=['dragPan','dragRotate','scrollZoom','boxZoom','doubleClickZoom','keyboard','touchZoomRotate','touchPitch'];
@@ -190,27 +191,66 @@ function brg(a,b){
 }
 
 
-function sampleRoute(u=playback.progress){
-  const x=Math.max(0,Math.min(1,u))*(C.length-1);
-  const i=Math.min(C.length-2,Math.floor(x)), t=x-i;
+function buildDistanceTable(){
+  segmentDistances=[];cumulativeDistances=[0];totalDistance=0;
+  for(let i=0;i<C.length-1;i++){
+    const distance=haversineKm(C[i],C[i+1]);
+    segmentDistances.push(distance);
+    totalDistance+=distance;
+    cumulativeDistances.push(totalDistance);
+  }
+}
+function sampleRouteAtDistance(targetDistance){
+  if(C.length<2) return {i:0,t:0,center:C[0]||[0,0]};
+  if(totalDistance===0){
+    const i=C.length-2,t=targetDistance>=0?1:0;
+    return {i,t,center:[C[i][0]+(C[i+1][0]-C[i][0])*t,C[i][1]+(C[i+1][1]-C[i][1])*t]};
+  }
+  const target=Math.max(0,Math.min(totalDistance,targetDistance));
+  let i;
+  if(target===totalDistance){
+    i=C.length-2;
+  }else{
+    // Find the first segment whose cumulative end reaches the target.
+    let low=0,high=C.length-2;
+    while(low<high){
+      const mid=(low+high)>>1;
+      if(cumulativeDistances[mid+1]<target) low=mid+1;
+      else high=mid;
+    }
+    i=low;
+  }
+  const length=segmentDistances[i];
+  const t=length>0?Math.max(0,Math.min(1,(target-cumulativeDistances[i])/length)):(target===totalDistance?1:0);
   const a=C[i],b=C[i+1];
   return {i,t,center:[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t]};
+}
+function sampleRoute(u=playback.progress){
+  const progress=Math.max(0,Math.min(1,u));
+  if(totalDistance===0 && C.length>=2){
+    const x=progress*(C.length-1),i=Math.min(C.length-2,Math.floor(x)),t=x-i;
+    const a=C[i],b=C[i+1];
+    return {i,t,center:[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t]};
+  }
+  return sampleRouteAtDistance(progress*totalDistance);
 }
 function feat(u){
   const {i,center}=sampleRoute(u);
   return {type:'Feature',properties:{},geometry:{type:'LineString',coordinates:[...C.slice(0,i+1),center]}};
 }
-function headingAt(i){
-  let j=Math.min(C.length-1,i+16);
-  while(j<C.length-1 && haversineKm(C[i],C[j])<1e-8) j++;
-  if(haversineKm(C[i],C[j])>=1e-8) return brg(C[i],C[j]);
-  let k=i;
-  while(k>0 && haversineKm(C[k],C[j])<1e-8) k--;
-  return haversineKm(C[k],C[j])>=1e-8?brg(C[k],C[j]):map.getBearing();
+function headingAt(u){
+  if(totalDistance===0) return map.getBearing();
+  const distance=Math.max(0,Math.min(1,u))*totalDistance;
+  const halfWindow=Math.min(0.05,totalDistance/2);
+  const from=Math.max(0,distance-halfWindow);
+  const to=Math.min(totalDistance,distance+halfWindow);
+  const a=sampleRouteAtDistance(from).center;
+  const b=sampleRouteAtDistance(to).center;
+  return haversineKm(a,b)>0?brg(a,b):map.getBearing();
 }
 function isFollow(){return ['north','route','manualFollow'].includes(mode);}
 function followOptions(){
-  const {i,t,center}=sampleRoute();
+  const {center}=sampleRoute();
   const options={center};
   // After a pan (including inertia), catch up once without starting an easeTo.
   if(recenter){
@@ -220,10 +260,7 @@ function followOptions(){
     if(t===1) recenter=null;
   }
   if(mode==='north') options.bearing=0;
-  if(mode==='route'){
-    const a=headingAt(i),b=headingAt(i+1);
-    options.bearing=a+(((b-a+540)%360)-180)*t;
-  }
+  if(mode==='route') options.bearing=headingAt(playback.progress);
   return options; // Manual follow never supplies pitch, bearing or zoom.
 }
 function cameraBusy(){
@@ -270,7 +307,8 @@ function renderProgress(){
   ui.scrub.value=Math.round(playback.progress*1000);
   ui.pText.textContent=Math.round(playback.progress*100)+'%';
   const elevation=E[i]!==null && E[i+1]!==null ? E[i]+(E[i+1]-E[i])*t : null;
-  ui.rstat.textContent=`Rakım ${elevation===null?'—':Math.round(elevation)+' m'} • nokta ${Math.min(C.length,Math.floor(playback.progress*(C.length-1))+1)}/${C.length}`;
+  const point=Math.min(C.length,i+1+(t>=1?1:0));
+  ui.rstat.textContent=`Rakım ${elevation===null?'—':Math.round(elevation)+' m'} • nokta ${point}/${C.length}`;
 }
 function stop(){
   playback.playing=false;
@@ -308,6 +346,7 @@ function clearRouteLayers(){
 function replaceRoute(parsed){
   clearRouteLayers();
   C=parsed.coords;E=parsed.elev;
+  buildDistanceTable();
   peakIndex=E.reduce((best,v,i)=>v!==null && (E[best]===null || v>E[best])?i:best,0);
   bounds=new maplibregl.LngLatBounds();C.forEach(c=>bounds.extend(c));
   playback.progress=0;
@@ -328,13 +367,12 @@ function replaceRoute(parsed){
   updateTileState();
 }
 function updateMeta(){
-  let km=0,min=Infinity,max=-Infinity;
+  let min=Infinity,max=-Infinity;
   for(let i=0;i<C.length;i++){
-    if(i) km+=haversineKm(C[i-1],C[i]);
     if(E[i]!==null){min=Math.min(min,E[i]);max=Math.max(max,E[i]);}
   }
   ui.pointCount.textContent=C.length.toLocaleString('tr-TR');
-  ui.distance.textContent=km.toFixed(1)+' km';
+  ui.distance.textContent=totalDistance.toFixed(1)+' km';
   ui.minEle.textContent=Number.isFinite(min)?Math.round(min)+' m':'—';
   ui.maxEle.textContent=Number.isFinite(max)?Math.round(max)+' m':'—';
   ui.meta.style.display='grid';
